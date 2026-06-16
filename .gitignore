@@ -1,0 +1,36 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+kvd
+
+# Test / coverage
+*.test
+coverage.out
+coverage.html
+*.coverprofile
+profile.cov
+
+# Go build cache / module (optional local)
+vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local env / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data (per README cluster examples: ./data/node1, etc.)
+data/
