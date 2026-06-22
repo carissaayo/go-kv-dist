@@ -111,15 +111,21 @@ func (r *RaftMeta) Save(hs raftpb.HardState, cs raftpb.ConfState) error {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("raftmeta: close tmp: %w", err)
 	}
+
+	// Windows cannot rename over an open destination file.
+	if r.file != nil {
+		if err := r.file.Close(); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("raftmeta: close before rename: %w", err)
+		}
+		r.file = nil
+	}
+
 	if err := os.Rename(tmpPath, r.path); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("raftmeta: rename: %w", err)
 	}
 
-	//Refresh open handle so a later Save on the same RaftMeta sees the new file.
-	if r.file != nil {
-		_ = r.file.Close()
-	}
 	opened, err := os.OpenFile(r.path, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("raftmeta: reopen after save: %w", err)
