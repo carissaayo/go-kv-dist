@@ -78,3 +78,12 @@ func OpenStorage(dataDir string, nodeID uint64) (*Storage, error) {
 
 	return s, nil
 }
+
+// Called once by etcd/raft on startup to return the HardState and ConfState last persisted to raft_meta, restoring the node's consensus identity after a restart.
+func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
+	hs, cs, err := s.meta.Load()
+	if err != nil {
+		return raftpb.HardState{}, raftpb.ConfState{}, fmt.Errorf("storage: load meta: %w", err)
+	}
+	return hs, cs, nil
+}
