@@ -87,3 +87,13 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	}
 	return hs, cs, nil
 }
+
+// Returns the index of the most recent log entry, which is 0 on a fresh node, being used by etcd/raft to determine the next index to assign.
+func (s *Storage) LastIndex() (uint64, error) {
+	return s.lastIndex, nil
+}
+
+// Returns the index of the first log entry still available.
+func (s *Storage) FirstIndex() (uint64, error) {
+	return s.firstIndex, nil
+}
