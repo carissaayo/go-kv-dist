@@ -16,6 +16,9 @@ import (
 	"github.com/gogo/protobuf/proto"
 )
 
+// Compile-time check that Storage implements raft.Storage.
+var _ raft.Storage = (*Storage)(nil)
+
 type logIndexEntry struct {
 	offset int64  // byte offset in raft.log
 	term   uint64 // from entry.Term
@@ -86,6 +89,24 @@ func OpenStorage(dataDir string, nodeID uint64) (*Storage, error) {
 	return s, nil
 }
 
+func (s *Storage) Close() error {
+	if s == nil {
+		return nil
+	}
+	var err error
+	if s.meta != nil {
+		if closeErr := s.meta.Close(); closeErr != nil {
+			err = closeErr
+		}
+	}
+	if s.log != nil {
+		if closeErr := s.log.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}
+	return err
+}
+
 // Called once by etcd/raft on startup to return the HardState and ConfState last persisted to raft_meta, restoring the node's consensus identity after a restart.
 func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	hs, cs, err := s.meta.Load()
@@ -124,6 +145,11 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	}
 
 	return entry.term, nil
+}
+
+// Snapshot is implemented in Phase 5.
+func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
+	return raftpb.Snapshot{}, raft.ErrUnavailable
 }
 
 // Returns log entries in the range [lo, hi], etcd/raft calls this when replicating entries to followers.
