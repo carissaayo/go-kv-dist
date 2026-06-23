@@ -219,3 +219,17 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
 	}
 	return nil
 }
+
+// Persists HardState from Ready() while ConfState is reloaded from raft_meta.
+func (s *Storage) SaveHardState(hs raftpb.HardState) error {
+	_, cs, err := s.meta.Load()
+	if err != nil {
+		return fmt.Errorf("storage: load conf state: %w", err)
+	}
+
+	if err := s.meta.Save(hs, cs); err != nil {
+		return fmt.Errorf("storage: save meta: %w", err)
+	}
+
+	return nil
+}
