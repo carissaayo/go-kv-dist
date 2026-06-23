@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/carissaayo/go-durable-kv/pkg/raftlog"
@@ -96,4 +97,25 @@ func (s *Storage) LastIndex() (uint64, error) {
 // Returns the index of the first log entry still available.
 func (s *Storage) FirstIndex() (uint64, error) {
 	return s.firstIndex, nil
+}
+
+// Returns the election term of the log entry at index i. Used by etcd/raft to verify log consistency between nodes — two entries match if and only if they share the same index AND term.
+func (s *Storage) Term(i uint64) (uint64, error) {
+	// Below the compaction boundary — we no longer have this entry
+	if i < s.firstIndex {
+		return 0, raft.ErrCompacted
+	}
+
+	// Above the last written entry — does not exist yet
+	if i > s.lastIndex {
+		return 0, raft.ErrUnavailable
+	}
+
+	entry, ok := s.index[i]
+	if !ok {
+		// Should never happen if firstIndex/lastIndex are consistent with index map
+		return 0, raft.ErrUnavailable
+	}
+
+	return entry.term, nil
 }
