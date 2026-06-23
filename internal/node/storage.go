@@ -1,13 +1,19 @@
 package node
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
+	"os"
 	"path/filepath"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/carissaayo/go-durable-kv/pkg/raftlog"
+	"github.com/gogo/protobuf/proto"
 )
 
 type logIndexEntry struct {
@@ -118,4 +124,97 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	}
 
 	return entry.term, nil
+}
+
+// Returns log entries in the range [lo, hi], etcd/raft calls this when replicating entries to followers.
+func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
+	if lo < s.firstIndex {
+		return nil, raft.ErrCompacted
+	}
+	if hi-1 > s.lastIndex {
+		return nil, raft.ErrUnavailable
+	}
+
+	// Open a fresh read handle — same pattern as RaftLog.Scan and WAL.Replay.
+	f, err := os.Open(s.meta.path)
+	if err != nil {
+		return nil, fmt.Errorf("storage: open raft.log for read: %w", err)
+	}
+	defer f.Close()
+
+	var (
+		entries   []raftpb.Entry
+		totalSize uint64
+	)
+
+	for idx := lo; idx < hi; idx++ {
+		indexEntry, ok := s.index[idx]
+		if !ok {
+			return nil, raft.ErrUnavailable
+		}
+
+		// Seek directly to this entry's byte offset — no scanning from the start
+		if _, err := f.Seek(indexEntry.offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("storage: seek to offset %d: %w", indexEntry.offset, err)
+		}
+
+		// Read the raw record bytes from raft.log
+		payload, err := readRecord(f)
+		if err != nil {
+			return nil, fmt.Errorf("storage: read record at offset %d: %w", indexEntry.offset, err)
+		}
+
+		// Decode the raw bytes back into a raftpb.Entry
+		var entry raftpb.Entry
+		if err := proto.Unmarshal(payload, &entry); err != nil {
+			return nil, fmt.Errorf("storage: unmarshal entry %d: %w", idx, err)
+		}
+
+		// Enforce maxSize — always include the first entry, stop before
+		// adding one that would push us over the limit
+		entrySize := uint64(proto.Size(&entry))
+		if len(entries) > 0 && totalSize+entrySize > maxSize {
+			break
+		}
+
+		entries = append(entries, entry)
+		totalSize += entrySize
+	}
+
+	return entries, nil
+}
+
+// This reads one length-prefixed record from f at its current position. It mirrors the record layout written by RaftLog.Append and returns the raw payload bytes.
+func readRecord(f *os.File) ([]byte, error) {
+	// Length prefix
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(f, lenBuf[:]); err != nil {
+		return nil, fmt.Errorf("read length prefix: %w", err)
+	}
+	const maxLen = 16 << 20
+	payloadLen := binary.BigEndian.Uint32(lenBuf[:])
+	if payloadLen == 0 || payloadLen > maxLen {
+		return nil, errors.New("record: invalid payload length")
+	}
+
+	// Payload
+	payload := make([]byte, payloadLen)
+	if _, err := io.ReadFull(f, payload); err != nil {
+		return nil, fmt.Errorf("read payload: %w", err)
+	}
+
+	// CRC
+	var crcBuf [4]byte
+	if _, err := io.ReadFull(f, crcBuf[:]); err != nil {
+		return nil, fmt.Errorf("read crc: %w", err)
+	}
+
+	h := crc32.NewIEEE()
+	h.Write(lenBuf[:])
+	h.Write(payload)
+	if h.Sum32() != binary.BigEndian.Uint32(crcBuf[:]) {
+		return nil, errors.New("record: checksum mismatch")
+	}
+
+	return payload, nil
 }
