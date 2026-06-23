@@ -4,6 +4,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/gogo/protobuf/proto"
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 )
@@ -107,8 +108,12 @@ func TestStorage_Entries_MaxSize(t *testing.T) {
 		t.Fatalf("Append() error = %v", err)
 	}
 
-	// Small maxSize: first entry fits, second would exceed limit.
-	got, err := s.Entries(1, 3, 32)
+	firstSize := uint64(proto.Size(&raftpb.Entry{
+		Index: 1, Term: 1, Type: raftpb.EntryNormal, Data: []byte("aaaa"),
+	}))
+
+	// Budget fits entry 1 only, not entry 1 + 2.
+	got, err := s.Entries(1, 3, firstSize)
 	if err != nil {
 		t.Fatalf("Entries() error = %v", err)
 	}
@@ -119,7 +124,6 @@ func TestStorage_Entries_MaxSize(t *testing.T) {
 		t.Fatalf("first entry index = %d, want 1", got[0].Index)
 	}
 }
-
 func TestStorage_SaveHardStateRoundTrip(t *testing.T) {
 	t.Parallel()
 
