@@ -194,3 +194,28 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 
 	return entries, nil
 }
+
+// Persists new raft entries from Ready().Entries and updates the in-memory index.
+func (s *Storage) Append(entries []raftpb.Entry) error {
+	for _, ent := range entries {
+		payload, err := ent.Marshal()
+		if err != nil {
+			return fmt.Errorf("storage: marshal entry %d: %w", ent.Index, err)
+		}
+
+		offset, err := s.log.Append(payload)
+		if err != nil {
+			return fmt.Errorf("storage: append entry %d: %w", ent.Index, err)
+		}
+
+		s.index[ent.Index] = logIndexEntry{
+			offset: offset,
+			term:   ent.Term,
+		}
+
+		if ent.Index > s.lastIndex {
+			s.lastIndex = ent.Index
+		}
+	}
+	return nil
+}
