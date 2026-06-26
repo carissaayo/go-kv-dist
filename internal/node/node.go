@@ -181,6 +181,52 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 	return n.raftNode.Propose(ctx, data)
 }
 
+func (n *Node) Set(ctx context.Context, key string, value []byte) error {
+	if n.Status().Lead != n.id {
+		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
+	}
+
+	data, err := kv.EncodeSet(key, value)
+	if err != nil {
+		return err
+	}
+
+	before := n.lastApplied.Load()
+	if err := n.Propose(ctx, data); err != nil {
+		return err
+	}
+
+	return n.waitUntilApplied(ctx, before)
+}
+
+func (n *Node) Get(key string) ([]byte, bool, error) {
+	return n.engine.Get(key)
+}
+
+func (n *Node) Engine() *engine.Engine {
+	return n.engine
+}
+
+func (n *Node) LeaderID() uint64 {
+	return n.Status().Lead
+}
+
+func (n *Node) waitUntilApplied(ctx context.Context, prev uint64) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if n.lastApplied.Load() > prev {
+				return nil
+			}
+		}
+	}
+}
+
 // Status returns the current raft status (leader, term, etc.).
 func (n *Node) Status() raft.Status {
 	return n.raftNode.Status()
@@ -190,6 +236,8 @@ func (n *Node) Status() raft.Status {
 func (n *Node) Storage() *Storage {
 	return n.storage
 }
+
+func (n *Node) ID() uint64 { return n.id }
 
 // Stop shuts down tick + Ready loops and closes storage.
 func (n *Node) Stop() {
@@ -203,5 +251,6 @@ func (n *Node) Stop() {
 	n.raftNode.Stop()
 	<-n.donec
 
+	_ = n.engine.Close()
 	_ = n.storage.Close()
 }
