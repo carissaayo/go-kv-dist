@@ -6,8 +6,12 @@ import (
 	"log"
 	"time"
 
+	"sync/atomic"
+
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+
+	"github.com/carissaayo/go-durable-kv/pkg/engine"
 )
 
 const (
@@ -21,12 +25,14 @@ const (
 // Node runs a single raft peer with local storage and an in-process transport (Step loopback).
 
 type Node struct {
-	id       uint64
-	dataDir  string
-	storage  *Storage
-	raftNode raft.Node
-	stopc    chan struct{}
-	donec    chan struct{}
+	id          uint64
+	dataDir     string
+	storage     *Storage
+	engine      *engine.Engine
+	raftNode    raft.Node
+	stopc       chan struct{}
+	donec       chan struct{}
+	lastApplied atomic.Uint64
 }
 
 // Opens storage and starts the raft node, tick loop, and Ready loop.
@@ -34,6 +40,15 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 	storage, err := OpenStorage(dataDir, id)
 	if err != nil {
 		return nil, fmt.Errorf("node: open storage: %w", err)
+	}
+
+	eng, err := engine.Open(engine.Config{
+		DataDir:    dataDir,
+		SyncPolicy: engine.SyncAlways,
+	})
+	if err != nil {
+		_ = storage.Close()
+		return nil, fmt.Errorf("node: open engine: %w", err)
 	}
 
 	cfg := raft.Config{
@@ -62,6 +77,7 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 		id:       id,
 		dataDir:  dataDir,
 		storage:  storage,
+		engine:   eng,
 		raftNode: rn,
 		stopc:    make(chan struct{}),
 		donec:    make(chan struct{}),
