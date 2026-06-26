@@ -8,9 +8,11 @@ require (
 )
 
 require (
-	github.com/gogo/protobuf v1.3.2 // indirect
 	github.com/golang/protobuf v1.5.4 // indirect
-	google.golang.org/protobuf v1.33.0 // indirect
+	github.com/google/go-cmp v0.6.0 // indirect
+	google.golang.org/protobuf v1.36.5 // indirect
 )
 
 replace github.com/carissaayo/go-durable-kv => "../personal/go projects/go-kv-store"
+
+require github.com/gogo/protobuf v1.3.2
