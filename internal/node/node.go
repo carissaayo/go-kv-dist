@@ -12,6 +12,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/carissaayo/go-durable-kv/pkg/engine"
+	"github.com/carissaayo/go-kv-dist/internal/kv"
 )
 
 const (
@@ -161,17 +162,18 @@ func (n *Node) processReady(rd raft.Ready) error {
 func (n *Node) applyCommitted(ent raftpb.Entry) error {
 	switch ent.Type {
 	case raftpb.EntryNormal:
-		if len(ent.Data) == 0 {
-			return nil
+		if len(ent.Data) > 0 {
+			if err := kv.Apply(n.engine, ent.Data); err != nil {
+				return err
+			}
 		}
-		// Phase 2: decode command and call engine Set/Delete.
-		return nil
 	case raftpb.EntryConfChange:
-		// Phase 3+: update ConfState in raft_meta when membership changes.
-		return nil
-	default:
-		return nil
+		// Phase 3+: update ConfState in raft_meta.
 	}
+
+	n.lastApplied.Store(ent.Index)
+
+	return nil
 }
 
 // Propose appends a command to the raft log (Task 6). Data must be non-empty for RaftLog.
