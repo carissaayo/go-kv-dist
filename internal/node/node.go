@@ -44,17 +44,20 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 		MaxSizePerMsg:   defaultMaxSizePerMsg,
 		MaxInflightMsgs: defaultMaxInflightMsg,
 	}
+
 	last, err := storage.LastIndex()
 	if err != nil {
 		_ = storage.Close()
 		return nil, fmt.Errorf("node: last index: %w", err)
 	}
+
 	var rn raft.Node
 	if last == 0 {
 		rn = raft.StartNode(&cfg, []raft.Peer{{ID: id}})
 	} else {
 		rn = raft.RestartNode(&cfg)
 	}
+
 	n := &Node{
 		id:       id,
 		dataDir:  dataDir,
@@ -63,27 +66,14 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 		stopc:    make(chan struct{}),
 		donec:    make(chan struct{}),
 	}
+
 	go n.tickLoop()
 	go n.runReadyLoop()
+
 	return n, nil
 }
 
-func (n *Node) runReadyLoop() {
-	defer close(n.donec)
-	for {
-		select {
-		case <-n.stopc:
-			return
-		case rd := <-n.raftNode.Ready():
-			if err := n.processReady(rd); err != nil {
-				log.Printf("node %d: process ready: %v", n.id, err)
-				return
-			}
-			n.raftNode.Advance()
-		}
-	}
-}
-
+// tick loop for maintaining leadership and for election
 func (n *Node) tickLoop() {
 	ticker := time.NewTicker(defaultTickInterval)
 	defer ticker.Stop()
@@ -98,34 +88,60 @@ func (n *Node) tickLoop() {
 	}
 }
 
+// The main raft loop where etcd sends work on Ready()
+func (n *Node) runReadyLoop() {
+	defer close(n.donec)
+
+	for {
+		select {
+		case <-n.stopc:
+			return
+		case rd := <-n.raftNode.Ready():
+			if err := n.processReady(rd); err != nil {
+				log.Printf("node %d: process ready: %v", n.id, err)
+				return
+			}
+			n.raftNode.Advance()
+		}
+	}
+}
+
+// Handles one raft.Ready batch — persist, apply, send messages.
 func (n *Node) processReady(rd raft.Ready) error {
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		// Phase 5: install snapshot into storage + state machine.
 		return fmt.Errorf("unexpected snapshot at index %d", rd.Snapshot.Metadata.Index)
 	}
+
 	if len(rd.Entries) > 0 {
 		if err := n.storage.Append(rd.Entries); err != nil {
 			return fmt.Errorf("append entries: %w", err)
 		}
 	}
+
 	if !raft.IsEmptyHardState(rd.HardState) {
 		if err := n.storage.SaveHardState(rd.HardState); err != nil {
 			return fmt.Errorf("save hard state: %w", err)
 		}
 	}
+
 	// Phase 1: committed entries are not applied to the KV engine yet.
 	for _, ent := range rd.CommittedEntries {
 		if err := n.applyCommitted(ent); err != nil {
 			return fmt.Errorf("apply committed entry %d: %w", ent.Index, err)
 		}
 	}
+
 	for _, msg := range rd.Messages {
 		if err := n.raftNode.Step(context.Background(), msg); err != nil {
 			return fmt.Errorf("step message: %w", err)
 		}
 	}
+
 	return nil
 }
+
+// Appies committed entries to the application
 func (n *Node) applyCommitted(ent raftpb.Entry) error {
 	switch ent.Type {
 	case raftpb.EntryNormal:
@@ -152,7 +168,7 @@ func (n *Node) Status() raft.Status {
 	return n.raftNode.Status()
 }
 
-// Storage returns the underlying storage (tests / inspection).
+// Returns the underlying storage
 func (n *Node) Storage() *Storage {
 	return n.storage
 }
@@ -165,7 +181,9 @@ func (n *Node) Stop() {
 	default:
 		close(n.stopc)
 	}
+
 	n.raftNode.Stop()
 	<-n.donec
+
 	_ = n.storage.Close()
 }
