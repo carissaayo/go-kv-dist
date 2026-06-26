@@ -29,12 +29,13 @@ type Node struct {
 	donec    chan struct{}
 }
 
-// NewNode opens storage and starts the raft node, tick loop, and Ready loop.
+// Opens storage and starts the raft node, tick loop, and Ready loop.
 func NewNode(dataDir string, id uint64) (*Node, error) {
 	storage, err := OpenStorage(dataDir, id)
 	if err != nil {
 		return nil, fmt.Errorf("node: open storage: %w", err)
 	}
+
 	cfg := raft.Config{
 		ID:              id,
 		ElectionTick:    defaultElectionTick,
@@ -50,9 +51,9 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 	}
 	var rn raft.Node
 	if last == 0 {
-		rn = raft.StartNode(cfg, []raft.Peer{{ID: id}})
+		rn = raft.StartNode(&cfg, []raft.Peer{{ID: id}})
 	} else {
-		rn = raft.RestartNode(cfg)
+		rn = raft.RestartNode(&cfg)
 	}
 	n := &Node{
 		id:       id,
@@ -82,6 +83,21 @@ func (n *Node) runReadyLoop() {
 		}
 	}
 }
+
+func (n *Node) tickLoop() {
+	ticker := time.NewTicker(defaultTickInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-n.stopc:
+			return
+		case <-ticker.C:
+			n.raftNode.Tick()
+		}
+	}
+}
+
 func (n *Node) processReady(rd raft.Ready) error {
 	if !raft.IsEmptySnap(rd.Snapshot) {
 		// Phase 5: install snapshot into storage + state machine.
