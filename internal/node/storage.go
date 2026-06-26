@@ -123,19 +123,21 @@ func (s *Storage) FirstIndex() (uint64, error) {
 
 // Returns the election term of the log entry at index i. Used by etcd/raft to verify log consistency between nodes — two entries match if and only if they share the same index AND term.
 func (s *Storage) Term(i uint64) (uint64, error) {
-	// Below the compaction boundary — we no longer have this entry
 	if i < s.firstIndex {
+		if i+1 == s.firstIndex {
+			// Virtual compacted entry at firstIndex-1 (index 0 on a fresh log).
+			// Phase 5: return snapshot term when firstIndex > 1 after compaction.
+			return 0, nil
+		}
 		return 0, raft.ErrCompacted
 	}
 
-	// Above the last written entry — does not exist yet
 	if i > s.lastIndex {
 		return 0, raft.ErrUnavailable
 	}
 
 	entry, ok := s.index[i]
 	if !ok {
-		// Should never happen if firstIndex/lastIndex are consistent with index map
 		return 0, raft.ErrUnavailable
 	}
 

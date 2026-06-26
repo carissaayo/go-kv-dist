@@ -208,9 +208,14 @@ func TestStorage_Term_Errors(t *testing.T) {
 	}
 	defer func() { _ = s.Close() }()
 
-	if _, err := s.Term(0); err != raft.ErrCompacted {
-		t.Fatalf("Term(0) error = %v, want ErrCompacted", err)
+	term, err := s.Term(0)
+	if err != nil {
+		t.Fatalf("Term(0) error = %v, want nil", err)
 	}
+	if term != 0 {
+		t.Fatalf("Term(0) = %d, want 0", term)
+	}
+
 	if _, err := s.Term(1); err != raft.ErrUnavailable {
 		t.Fatalf("Term(1) error = %v, want ErrUnavailable", err)
 	}
