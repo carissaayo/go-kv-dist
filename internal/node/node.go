@@ -43,10 +43,9 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 		return nil, fmt.Errorf("node: open storage: %w", err)
 	}
 
-	eng, err := engine.Open(engine.Config{
-		DataDir:    dataDir,
-		SyncPolicy: engine.SyncAlways,
-	})
+	engCfg := engine.DefaultConfig(dataDir)
+	engCfg.SyncPolicy = engine.SyncAlways
+	eng, err := engine.Open(engCfg)
 	if err != nil {
 		_ = storage.Close()
 		return nil, fmt.Errorf("node: open engine: %w", err)
@@ -63,6 +62,7 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 
 	last, err := storage.LastIndex()
 	if err != nil {
+		_ = eng.Close()
 		_ = storage.Close()
 		return nil, fmt.Errorf("node: last index: %w", err)
 	}
@@ -187,6 +187,24 @@ func (n *Node) Set(ctx context.Context, key string, value []byte) error {
 	}
 
 	data, err := kv.EncodeSet(key, value)
+	if err != nil {
+		return err
+	}
+
+	before := n.lastApplied.Load()
+	if err := n.Propose(ctx, data); err != nil {
+		return err
+	}
+
+	return n.waitUntilApplied(ctx, before)
+}
+
+func (n *Node) Delete(ctx context.Context, key string) error {
+	if n.Status().Lead != n.id {
+		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
+	}
+
+	data, err := kv.EncodeDelete(key)
 	if err != nil {
 		return err
 	}
