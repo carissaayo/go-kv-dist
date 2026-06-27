@@ -23,7 +23,12 @@ const (
 	defaultMaxInflightMsg = 256
 )
 
-// Node runs a single raft peer with local storage and an in-process transport (Step loopback).
+// Node runs a single raft peer with local storage and optional gRPC peer transport.
+
+type Options struct {
+	// PeerAddrs maps raft node ID to gRPC dial address. If empty, runs single-node loopback.
+	PeerAddrs map[uint64]string
+}
 
 type Node struct {
 	id          uint64
@@ -31,13 +36,20 @@ type Node struct {
 	storage     *Storage
 	engine      *engine.Engine
 	raftNode    raft.Node
+	transport   *Transport
+	peerAddrs   map[uint64]string
 	stopc       chan struct{}
 	donec       chan struct{}
 	lastApplied atomic.Uint64
 }
 
 // Opens storage and starts the raft node, tick loop, and Ready loop.
-func NewNode(dataDir string, id uint64) (*Node, error) {
+func NewNode(dataDir string, id uint64, opts Options) (*Node, error) {
+	peerAddrs := opts.PeerAddrs
+	if len(peerAddrs) == 0 {
+		peerAddrs = map[uint64]string{id: ""}
+	}
+
 	storage, err := OpenStorage(dataDir, id)
 	if err != nil {
 		return nil, fmt.Errorf("node: open storage: %w", err)
@@ -69,19 +81,26 @@ func NewNode(dataDir string, id uint64) (*Node, error) {
 
 	var rn raft.Node
 	if last == 0 {
-		rn = raft.StartNode(&cfg, []raft.Peer{{ID: id}})
+		rn = raft.StartNode(&cfg, raftPeers(peerAddrs))
 	} else {
 		rn = raft.RestartNode(&cfg)
 	}
 
+	var transport *Transport
+	if isCluster(peerAddrs) {
+		transport = NewTransport(id, peerAddrs)
+	}
+
 	n := &Node{
-		id:       id,
-		dataDir:  dataDir,
-		storage:  storage,
-		engine:   eng,
-		raftNode: rn,
-		stopc:    make(chan struct{}),
-		donec:    make(chan struct{}),
+		id:        id,
+		dataDir:   dataDir,
+		storage:   storage,
+		engine:    eng,
+		raftNode:  rn,
+		transport: transport,
+		peerAddrs: peerAddrs,
+		stopc:     make(chan struct{}),
+		donec:     make(chan struct{}),
 	}
 
 	go n.tickLoop()
@@ -150,12 +169,33 @@ func (n *Node) processReady(rd raft.Ready) error {
 	}
 
 	for _, msg := range rd.Messages {
-		if err := n.raftNode.Step(context.Background(), msg); err != nil {
-			return fmt.Errorf("step message: %w", err)
+		if err := n.sendRaftMessage(msg); err != nil {
+			return fmt.Errorf("send message: %w", err)
 		}
 	}
 
 	return nil
+}
+
+func (n *Node) sendRaftMessage(msg raftpb.Message) error {
+	if msg.To == n.id {
+		return n.raftNode.Step(context.Background(), msg)
+	}
+
+	if n.transport == nil {
+		return n.raftNode.Step(context.Background(), msg)
+	}
+
+	if err := n.transport.Send(context.Background(), msg); err != nil {
+		logSendError(n, msg.To, err)
+	}
+
+	return nil
+}
+
+// Step applies an inbound raft message from a peer (or loopback).
+func (n *Node) Step(ctx context.Context, msg raftpb.Message) error {
+	return n.raftNode.Step(ctx, msg)
 }
 
 // Appies committed entries to the application
@@ -168,7 +208,16 @@ func (n *Node) applyCommitted(ent raftpb.Entry) error {
 			}
 		}
 	case raftpb.EntryConfChange:
-		// Phase 3+: update ConfState in raft_meta.
+		var cc raftpb.ConfChange
+		if err := cc.Unmarshal(ent.Data); err != nil {
+			return fmt.Errorf("unmarshal conf change: %w", err)
+		}
+		cs := n.raftNode.ApplyConfChange(cc)
+		if cs != nil {
+			if err := n.storage.SaveConfState(*cs); err != nil {
+				return err
+			}
+		}
 	}
 
 	n.lastApplied.Store(ent.Index)
@@ -192,12 +241,16 @@ func (n *Node) Set(ctx context.Context, key string, value []byte) error {
 		return err
 	}
 
-	before := n.lastApplied.Load()
+	beforeLast, err := n.storage.LastIndex()
+	if err != nil {
+		return err
+	}
+
 	if err := n.Propose(ctx, data); err != nil {
 		return err
 	}
 
-	return n.waitUntilApplied(ctx, before)
+	return n.waitUntilCaughtUp(ctx, beforeLast)
 }
 
 func (n *Node) Delete(ctx context.Context, key string) error {
@@ -211,12 +264,16 @@ func (n *Node) Delete(ctx context.Context, key string) error {
 		return err
 	}
 
-	before := n.lastApplied.Load()
+	beforeLast, err := n.storage.LastIndex()
+	if err != nil {
+		return err
+	}
+
 	if err := n.Propose(ctx, data); err != nil {
 		return err
 	}
 
-	return n.waitUntilApplied(ctx, before)
+	return n.waitUntilCaughtUp(ctx, beforeLast)
 }
 
 func (n *Node) Get(key string) ([]byte, bool, error) {
@@ -231,7 +288,16 @@ func (n *Node) LeaderID() uint64 {
 	return n.Status().Lead
 }
 
-func (n *Node) waitUntilApplied(ctx context.Context, prev uint64) error {
+// LeaderAddr returns the gRPC address of the current leader, if known.
+func (n *Node) LeaderAddr() string {
+	lead := n.LeaderID()
+	if lead == 0 {
+		return ""
+	}
+	return n.peerAddrs[lead]
+}
+
+func (n *Node) waitUntilCaughtUp(ctx context.Context, prevLast uint64) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -240,7 +306,12 @@ func (n *Node) waitUntilApplied(ctx context.Context, prev uint64) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if n.lastApplied.Load() > prev {
+			last, err := n.storage.LastIndex()
+			if err != nil {
+				return err
+			}
+			applied := n.lastApplied.Load()
+			if last > prevLast && applied >= last {
 				return nil
 			}
 		}
@@ -271,6 +342,9 @@ func (n *Node) Stop() {
 	n.raftNode.Stop()
 	<-n.donec
 
+	if n.transport != nil {
+		_ = n.transport.Close()
+	}
 	_ = n.engine.Close()
 	_ = n.storage.Close()
 }
