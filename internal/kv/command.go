@@ -9,6 +9,8 @@ const (
 	OpSet    byte = 1
 	OpDelete byte = 2
 )
+const maxKeyLen = 1 << 16
+const maxValLen = 1 << 20
 
 type Command struct {
 	Op    byte
@@ -107,6 +109,3 @@ func Decode(data []byte) (Command, error) {
 		return Command{}, fmt.Errorf("kv: unknown op %d", op)
 	}
 }
-
-const maxKeyLen = 1 << 16
-const maxValLen = 1 << 20

@@ -182,6 +182,7 @@ func (n *Node) Propose(ctx context.Context, data []byte) error {
 }
 
 func (n *Node) Set(ctx context.Context, key string, value []byte) error {
+	//Only leader may propose
 	if n.Status().Lead != n.id {
 		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
 	}
@@ -200,6 +201,7 @@ func (n *Node) Set(ctx context.Context, key string, value []byte) error {
 }
 
 func (n *Node) Delete(ctx context.Context, key string) error {
+	//Only leader may propose
 	if n.Status().Lead != n.id {
 		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
 	}

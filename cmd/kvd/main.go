@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 
 	"github.com/carissaayo/go-kv-dist/internal/api"
 	"github.com/carissaayo/go-kv-dist/internal/node"
@@ -44,6 +45,7 @@ func main() {
 
 	srv := grpc.NewServer()
 	pb.RegisterKVServer(srv, api.NewKVServer(n))
+	reflection.Register(srv) // enables grpcurl list/describe without -proto
 
 	go func() {
 		if err := srv.Serve(lis); err != nil {
