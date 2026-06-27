@@ -235,3 +235,17 @@ func (s *Storage) SaveHardState(hs raftpb.HardState) error {
 
 	return nil
 }
+
+// Persists an updated cluster configuration.
+func (s *Storage) SaveConfState(cs raftpb.ConfState) error {
+	hs, _, err := s.meta.Load()
+	if err != nil {
+		return fmt.Errorf("storage: load hard state: %w", err)
+	}
+
+	if err := s.meta.Save(hs, cs); err != nil {
+		return fmt.Errorf("storage: save conf state: %w", err)
+	}
+
+	return nil
+}
