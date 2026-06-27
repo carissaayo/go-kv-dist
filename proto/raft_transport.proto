@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package rafttransportpb;
+
+option go_package = "github.com/carissaayo/go-kv-dist/proto/rafttransportpb";
+
+// RaftTransport ships raftpb.Message between peers (MsgApp, MsgVote, etc.).
+service RaftTransport {
+  rpc Send(RaftMessage) returns (RaftMessageAck);
+}
+
+message RaftMessage {
+  bytes data = 1; // gogo-marshaled raftpb.Message
+}
+
+message RaftMessageAck {}
