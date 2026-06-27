@@ -50,6 +50,10 @@ func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Delet
 func (s *KVServer) requireLeader() error {
 	lead := s.node.LeaderID()
 	if lead != s.node.ID() {
+		addr := s.node.LeaderAddr()
+		if addr != "" {
+			return status.Errorf(codes.FailedPrecondition, "not leader; leader_id=%d leader_addr=%s", lead, addr)
+		}
 		return status.Errorf(codes.FailedPrecondition, "not leader; leader_id=%d", lead)
 	}
 	return nil
