@@ -3,11 +3,13 @@ package node
 import (
 	"context"
 	"fmt"
-
+	"log"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -123,4 +125,29 @@ func ParsePeerAddrs(selfID uint64, selfAddr, peersFlag string) (map[uint64]strin
 		addrs[id] = addr
 	}
 	return addrs, nil
+}
+
+func raftPeers(addrs map[uint64]string) []raft.Peer {
+	ids := make([]uint64, 0, len(addrs))
+	for id := range addrs {
+		ids = append(ids, id)
+	}
+
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	peers := make([]raft.Peer, len(ids))
+
+	for i, id := range ids {
+		peers[i] = raft.Peer{ID: id}
+	}
+
+	return peers
+}
+
+func isCluster(addrs map[uint64]string) bool {
+	return len(addrs) > 1
+}
+
+// logSendError is kept as a variable for tests.
+var logSendError = func(n *Node, to uint64, err error) {
+	log.Printf("node %d: send to %d: %v", n.id, to, err)
 }
