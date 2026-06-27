@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 
+	"strconv"
+	"strings"
 	"sync"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -72,4 +74,53 @@ func (t *Transport) client(id uint64, addr string) (rtpb.RaftTransportClient, er
 	t.conns[id] = conn
 	t.clients[id] = rtpb.NewRaftTransportClient(conn)
 	return t.clients[id], nil
+}
+
+func (t *Transport) Close() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var first error
+	for id, conn := range t.conns {
+		if err := conn.Close(); err != nil && first == nil {
+			first = err
+		}
+
+		delete(t.conns, id)
+		delete(t.clients, id)
+	}
+	return first
+}
+
+// Builds id→address map from --peers and includes selfAddr for selfID; format: "2=localhost:50052,3=localhost:50053"
+func ParsePeerAddrs(selfID uint64, selfAddr, peersFlag string) (map[uint64]string, error) {
+	addrs := map[uint64]string{selfID: selfAddr}
+	if peersFlag == "" {
+		return addrs, nil
+	}
+
+	for _, part := range strings.Split(peersFlag, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+
+		kv := strings.SplitN(part, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("peers: invalid segment %q", part)
+		}
+
+		id, err := strconv.ParseUint(strings.TrimSpace(kv[0]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("peers: parse id in %q: %w", part, err)
+		}
+
+		addr := strings.TrimSpace(kv[1])
+		if addr == "" {
+			return nil, fmt.Errorf("peers: empty address in %q", part)
+		}
+
+		addrs[id] = addr
+	}
+	return addrs, nil
 }
