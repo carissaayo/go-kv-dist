@@ -14,7 +14,7 @@ import (
 
 	"github.com/carissaayo/go-kv-dist/internal/api"
 	"github.com/carissaayo/go-kv-dist/internal/node"
-	pb "github.com/carissaayo/go-kv-dist/proto"
+	pb "github.com/carissaayo/go-kv-dist/proto/kvpb"
 )
 
 func main() {
