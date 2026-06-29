@@ -7,7 +7,9 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
+	"github.com/carissaayo/go-durable-kv/pkg/engine"
 	"github.com/carissaayo/go-durable-kv/pkg/raftlog"
+	"github.com/carissaayo/go-kv-dist/internal/kv"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -20,18 +22,17 @@ type logIndexEntry struct {
 }
 
 type Storage struct {
-	dataDir string
-	nodeID  uint64
-
-	log  *raftlog.RaftLog
-	meta *RaftMeta
-
-	index      map[uint64]logIndexEntry // raft Index → offset + term
-	firstIndex uint64                   // 1 until compaction (Phase 5)
-	lastIndex  uint64
-
-	snapIndex uint64 // metadata.Index of last installed snapshot
-	snapTerm  uint64 // metadata.Term of last installed snapshot
+	dataDir      string
+	nodeID       uint64
+	log          *raftlog.RaftLog
+	meta         *RaftMeta
+	eng          *engine.Engine
+	appliedIndex uint64
+	index        map[uint64]logIndexEntry // raft Index → offset + term
+	firstIndex   uint64
+	lastIndex    uint64
+	snapIndex    uint64 // metadata.Index of last installed snapshot
+	snapTerm     uint64 // metadata.Term of last installed snapshot
 }
 
 func OpenStorage(dataDir string, nodeID uint64) (*Storage, error) {
@@ -62,10 +63,20 @@ func OpenStorage(dataDir string, nodeID uint64) (*Storage, error) {
 		lastIndex:  0,
 	}
 
+	if err := s.loadSnapMeta(); err != nil {
+		_ = meta.Close()
+		_ = raftLog.Close()
+		return nil, err
+	}
+
 	if err := raftLog.Scan(func(offset int64, payload []byte) error {
 		var entry raftpb.Entry
 		if err := entry.Unmarshal(payload); err != nil {
 			return fmt.Errorf("storage: unmarshal entry at offset %d: %w", offset, err)
+		}
+
+		if entry.Index < s.firstIndex {
+			return nil
 		}
 
 		s.index[entry.Index] = logIndexEntry{
@@ -148,9 +159,44 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	return entry.term, nil
 }
 
-// Snapshot is implemented in Phase 5.
 func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
-	return raftpb.Snapshot{}, raft.ErrUnavailable
+	if s.lastIndex == 0 {
+		return raftpb.Snapshot{}, raft.ErrUnavailable
+	}
+
+	applied := s.lastAppliedIndex()
+	if applied == 0 {
+		// No KV applied yet; conf-change-only log — not ready to snap KV state.
+		return raftpb.Snapshot{}, raft.ErrUnavailable
+	}
+
+	data, err := s.engineSnapshotData()
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+	payload, err := kv.EncodeState(data)
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+
+	entry, ok := s.index[applied]
+	if !ok {
+		return raftpb.Snapshot{}, fmt.Errorf("storage: no term for applied index %d", applied)
+	}
+
+	_, cs, err := s.meta.Load()
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+
+	return raftpb.Snapshot{
+		Data: payload,
+		Metadata: raftpb.SnapshotMetadata{
+			Index:     applied,
+			Term:      entry.term,
+			ConfState: cs,
+		},
+	}, nil
 }
 
 // Returns log entries in the range [lo, hi], etcd/raft calls this when replicating entries to followers.
@@ -252,4 +298,22 @@ func (s *Storage) SaveConfState(cs raftpb.ConfState) error {
 	}
 
 	return nil
+}
+
+func (s *Storage) SetEngine(eng *engine.Engine) {
+	s.eng = eng
+}
+
+// SetAppliedIndex records the highest log index applied to the KV engine.
+func (s *Storage) SetAppliedIndex(idx uint64) {
+	s.appliedIndex = idx
+}
+func (s *Storage) engineSnapshotData() (map[string][]byte, error) {
+	if s.eng == nil {
+		return nil, fmt.Errorf("storage: engine not set")
+	}
+	return engine.SnapshotData(s.eng)
+}
+func (s *Storage) lastAppliedIndex() uint64 {
+	return s.appliedIndex
 }
