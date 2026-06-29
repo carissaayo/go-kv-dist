@@ -12,7 +12,7 @@ func TestNode_ProposeAndRestart(t *testing.T) {
 	const id uint64 = 1
 	dir := t.TempDir()
 
-	n, err := NewNode(dir, id)
+	n, err := NewNode(dir, id, Options{})
 	if err != nil {
 		t.Fatalf("NewNode() error = %v", err)
 	}
@@ -47,7 +47,7 @@ func TestNode_ProposeAndRestart(t *testing.T) {
 
 	n.Stop()
 
-	n2, err := NewNode(dir, id)
+	n2, err := NewNode(dir, id, Options{})
 	if err != nil {
 		t.Fatalf("NewNode() restart error = %v", err)
 	}
