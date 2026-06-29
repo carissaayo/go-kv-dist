@@ -1,186 +1,190 @@
-# mini-dist-kv
+# go-kv-dist
 
-A 3-node, Raft-replicated key-value service. Writes are committed through [etcd/raft](https://github.com/etcd-io/raft) before being acknowledged, giving linearizable reads from the leader and no data loss after a leader failure. The **KV state machine** is not reimplemented here — it uses the existing [`go-durable-kv`](#dependency-go-durable-kv) engine (`Set` / `Get` / `Delete`, WAL + snapshot + in-memory map). **Consensus persistence** is a sibling **`RaftLog`** (`raft.log`) in the same data directory; `internal/node/storage.go` implements `raft.Storage` on top of it. All client and peer traffic runs over gRPC.
+A 3-node Raft-replicated key-value service written in Go. Writes are committed through [etcd/raft](https://github.com/etcd-io/raft) before being acknowledged. The KV state machine is provided by [`go-durable-kv`](https://github.com/carissaayo/go-durable-kv); this repository implements consensus, replication, snapshots, and the gRPC API.
 
-| Target | Value |
+| | |
 |---|---|
-| Correctness | No committed data lost after a leader crash |
-| Availability | Writes resume within ~2s of leader death |
-| Consistency | Linearizable reads from the leader |
-| Language | Go 1.21+ |
-| Consensus | etcd/raft |
-| Transport | gRPC (client API + inter-node Raft messages) |
-| Cluster size | 3 nodes |
+| **Consensus** | etcd/raft (3-node cluster) |
+| **Transport** | gRPC — client API and inter-node Raft messages on the same port |
+| **Storage** | Separate consensus log (`raft.log`) and KV engine (`wal.log` + `snapshot.gob`) |
+| **Observability** | Prometheus metrics + structured logs (`log/slog`) |
 
-## Why gRPC instead of HTTP
+## How it works
 
-The original design allowed either HTTP or gRPC for the client API and either gRPC or raw HTTP/2 for the Raft peer transport. This project standardizes on **gRPC for both**, which simplifies the stack to a single proto-defined contract and gives streaming, deadlines, and connection multiplexing for free.
+1. A client calls `Set` or `Delete` on any node.
+2. If the node is not the leader, it returns `FAILED_PRECONDITION` with the current leader ID and address in the error message.
+3. The leader proposes the command to Raft; a majority persists the entry to `raft.log`.
+4. On commit, each node applies the command to its local KV engine (appends to `wal.log`).
+5. `Get` is served from the local engine on whichever node receives the request (eventually consistent on followers).
 
-The one design change this forces: HTTP's `307 Temporary Redirect` for leader redirection has no gRPC equivalent. Instead, a non-leader node returns a `FAILED_PRECONDITION` status and attaches the current leader's address as response metadata (e.g. an `x-raft-leader` trailer, or a `leader_hint` field on the response message). A client-side interceptor catches that status, re-dials the leader, and retries — so callers still get "send to any node" behavior without manual redirect handling.
+```
+ Client                    Leader                     Followers
+   |                         |                            |
+   |  Set(k,v) via gRPC      |                            |
+   |------------------------>|  Propose + replicate       |
+   |                         |--------------------------->|
+   |                         |  Commit + apply to engine  |
+   |  OK                     |                            |
+   |<------------------------|                            |
+```
 
-## Dependency: go-durable-kv
+Raft log compaction and KV snapshots are coordinated: when the leader compacts old log entries, lagging followers can catch up via a Raft snapshot that carries a serialized copy of the KV map.
 
-This project does not contain its own KV engine. It imports [`github.com/carissaayo/go-durable-kv`](https://github.com/carissaayo/go-durable-kv) for the **state machine** and a low-level **`RaftLog`** type for **consensus bytes**. The two are deliberately separate:
+## Quick start
 
-| Component | Source | Role |
+### Prerequisites
+
+- Go 1.21+
+- [`go-durable-kv`](https://github.com/carissaayo/go-durable-kv) — listed in `go.mod`; use the `replace` directive for a local checkout while developing both repos
+- `protoc` + `protoc-gen-go` / `protoc-gen-go-grpc` (only needed to regenerate stubs from `proto/`)
+
+### Build
+
+```bash
+go build -o kvd ./cmd/kvd
+```
+
+### Run a 3-node cluster
+
+Use `127.0.0.1` on Windows to avoid IPv6/`localhost` resolution issues. Start all three nodes within a few seconds so election stabilizes quickly.
+
+```bash
+# Terminal 1
+./kvd --id 1 --addr 127.0.0.1:50051 --peers 2=127.0.0.1:50052,3=127.0.0.1:50053 --data ./data/node1 --metrics 127.0.0.1:9091
+
+# Terminal 2
+./kvd --id 2 --addr 127.0.0.1:50052 --peers 1=127.0.0.1:50051,3=127.0.0.1:50053 --data ./data/node2 --metrics 127.0.0.1:9092
+
+# Terminal 3
+./kvd --id 3 --addr 127.0.0.1:50053 --peers 1=127.0.0.1:50051,2=127.0.0.1:50052 --data ./data/node3 --metrics 127.0.0.1:9093
+```
+
+Each process listens on one gRPC address for both the client `KV` service and the peer `RaftTransport` service. Prometheus metrics are exposed on a separate HTTP port (see below).
+
+### `kvd` flags
+
+| Flag | Default | Description |
 |---|---|---|
-| **`Engine`** | `go-durable-kv/internal/engine` | User KV: in-memory map + `wal.log` + `snapshot.gob`; only updated from **committed** apply |
-| **`RaftLog`** | `go-durable-kv/internal/raftlog` | Consensus: append-only `raft.log` (CRC-framed opaque payloads); no user keys, no map replay |
+| `--id` | `1` | Raft node ID |
+| `--addr` | `localhost:50051` | gRPC listen address (KV + Raft transport) |
+| `--peers` | | Peer map: `id=host:port,id=host:port` (omit self; self uses `--addr`) |
+| `--data` | `./data/node1` | Data directory for this node |
+| `--metrics` | `localhost:9090` | Prometheus `/metrics` listen address (`""` disables) |
+| `--listen` | | Deprecated alias for `--addr` |
 
-Concretely:
+### Example client calls
 
-- `go.mod` requires the module (use a `replace` directive to a local checkout while developing both repos side by side):
-  ```
-  require github.com/carissaayo/go-durable-kv v0.x.x
-  ```
-- `internal/node/storage.go` implements `raft.Storage`: marshals `raftpb.Entry` into `RaftLog`, keeps an in-memory index, persists `HardState` / `ConfState` to `raft_meta`, and coordinates raft snapshots with the engine.
-- `internal/kv/apply.go` decodes **committed** raft commands and calls the engine's `Get` / `Set` / `Delete` — never the other way around (proposals do not call `Engine.Set` directly).
+With [grpcurl](https://github.com/fullstorydev/grpcurl) (reflection is enabled):
 
-## Architecture
+```bash
+# Write (must hit the leader, or read the redirect error for leader_addr)
+grpcurl -plaintext -d '{"key":"foo","value":"aGVsbG8="}' 127.0.0.1:50051 kvpb.KV/Set
 
-| Layer | Component | Technology | Purpose |
-|---|---|---|---|
-| Client | gRPC client | grpc-go | Sends `Get` / `Set` / `Delete` to any node |
-| Gateway | gRPC service | Go (generated stubs) | Redirects writes to the leader, serves reads locally |
-| Consensus | Raft node | etcd/raft | Log replication, leader election, commit notifications |
-| State machine | KV apply loop | Go goroutine | Applies committed Raft entries to the KV engine |
-| Consensus storage | RaftLog | `go-durable-kv` (imported) | `raft.log` — durable raft entry stream |
-| KV storage | Engine | `go-durable-kv` (imported) | In-memory map + `wal.log` + `snapshot.gob` |
-| Transport | Raft peer transport | gRPC | Inter-node Raft message delivery |
+# Read (any node)
+grpcurl -plaintext -d '{"key":"foo"}' 127.0.0.1:50051 kvpb.KV/Get
 
-### Propose → commit → apply flow
-
-1. Client calls `Set(key, val)` on any node via gRPC.
-2. If the node isn't leader, it returns `FAILED_PRECONDITION` with the leader's address attached; the client retries there.
-3. The leader calls `node.Propose(ctx, encodedCommand)`.
-4. etcd/raft replicates the entry to a majority of nodes; each node's `Ready()` loop persists new entries to **`raft.log`** via `RaftLog`.
-5. The entry appears in `Ready().CommittedEntries` on the leader (and eventually followers).
-6. The apply goroutine decodes the command and calls the imported engine's `Set` (which appends to **`wal.log`**).
-7. The leader responds to the client with success.
-
-## Proto definitions
-
-Two services live under `proto/`:
-
-- **`kv.proto`** — the client-facing API (`Get`, `Set`, `Delete`), returned status codes for leader redirection, and read-mode selection (leader / follower / ReadIndex).
-- **`raft_transport.proto`** — the inter-node service used to ship Raft messages (`MsgApp`, `MsgVote`, snapshots, etc.) between peers in place of raw HTTP/2.
-
-## Project structure
-
-```
-mini-dist-kv/
-├── cmd/kvd/main.go              # Node bootstrap, flag parsing, signal handling
-├── internal/
-│   ├── node/
-│   │   ├── node.go              # Raft node lifecycle, Ready() loop
-│   │   ├── storage.go           # raft.Storage over RaftLog + raft_meta; snapshot ties to Engine
-│   │   └── transport.go         # gRPC peer message send/receive
-│   ├── kv/
-│   │   ├── apply.go             # Committed entry decode + call into go-durable-kv Engine
-│   │   └── snapshot.go          # Snapshot trigger + serialize
-│   ├── api/
-│   │   └── server.go            # gRPC KVService impl: leader check, propose, leader-hint on redirect
-│   └── metrics/
-│       └── metrics.go           # Prometheus Raft + KV metrics
-├── proto/
-│   ├── kv.proto                 # Client-facing gRPC service
-│   └── raft_transport.proto     # Inter-node Raft transport service
-├── docs/
-│   └── architecture.md
-├── go.mod                       # requires go-durable-kv as a dependency
-└── README.md
+# Delete
+grpcurl -plaintext -d '{"key":"foo"}' 127.0.0.1:50051 kvpb.KV/Delete
 ```
 
-## Persistence layout
+`Set` values are raw bytes (base64 in JSON). A non-leader responds with gRPC status `FailedPrecondition` and a message like `not leader; leader_id=2 leader_addr=127.0.0.1:50052`.
 
-Each node stores consensus and KV data under `--data`. Two logs, one responsibility each:
+## API
+
+Defined in `proto/kv.proto`:
+
+| RPC | Behavior |
+|---|---|
+| `Get` | Local read from the node's KV engine |
+| `Set` | Leader only; proposed to Raft and waited until applied |
+| `Delete` | Leader only; proposed to Raft and waited until applied |
+
+Inter-node Raft messages are defined in `proto/raft_transport.proto` (`RaftTransport.Send`).
+
+## Persistence
+
+Each node's `--data` directory holds two independent storage layers:
 
 | File | Component | Contents |
 |---|---|---|
-| `raft.log` | `RaftLog` | CRC-framed serialized `raftpb.Entry` records (consensus log) |
-| `raft_meta` | `storage.go` | `HardState`, `ConfState`, compact watermark (`FirstIndex`) |
-| `wal.log` | `Engine` | KV `Set` / `Delete` records (written only after commit + apply) |
+| `raft.log` | `RaftLog` | CRC-framed serialized `raftpb.Entry` records |
+| `raft_meta` | `RaftMeta` | `HardState` + `ConfState` |
+| `raft_snap_meta` | `Storage` | Snapshot/compaction watermark (`snapIndex`, `snapTerm`, `firstIndex`) |
+| `wal.log` | `Engine` | KV `Set` / `Delete` records (written only after commit) |
 | `snapshot.gob` | `Engine` | KV map checkpoint |
 
-Phase 1 may create only `raft.log` and `raft_meta`; `wal.log` appears once the engine is opened and KV commands are applied (Phase 2).
-
-## Raft storage interface
-
-`raft.Storage` is implemented in this repo on top of **`RaftLog`**, not the engine's KV WAL.
-
-| Method | Backed by |
-|---|---|
-| `InitialState()` | `raft_meta` — `HardState` (term, vote, commit) + `ConfState` |
-| `Entries(lo, hi, maxSize)` | In-memory index → read payloads from `raft.log` |
-| `Term(i)` | Entry at index `i` from the index / `raft.log` |
-| `LastIndex()` | Last appended raft log index |
-| `FirstIndex()` | First index after the last raft snapshot / compaction |
-| `Snapshot()` | Latest raft snapshot: metadata + serialized KV map from `Engine` |
-
-Raft log compaction (`RaftLog` truncate) and KV WAL compaction (`Engine` snapshot) are coordinated at snapshot time but triggered by different rules (raft commit index vs engine WAL size).
-
-## Running a 3-node cluster
-
-```bash
-# Node 1
-./kvd --id 1 --addr :8081 --peers 2=localhost:8082,3=localhost:8083 --data ./data/node1
-
-# Node 2
-./kvd --id 2 --addr :8082 --peers 1=localhost:8081,3=localhost:8083 --data ./data/node2
-
-# Node 3
-./kvd --id 3 --addr :8083 --peers 1=localhost:8081,2=localhost:8082 --data ./data/node3
-```
-
-All three flags (`--addr`, `--peers`) refer to gRPC listen addresses — the same port serves both the client `KVService` and the peer `RaftTransport` service.
-
-## Read consistency options
-
-| Mode | Consistency | Implementation |
-|---|---|---|
-| Leader reads | Linearizable — always reflects the latest committed write | Route all `Get` calls to the current leader |
-| Follower reads | Eventually consistent — may be slightly stale | Any node serves `Get` from its local map |
-| ReadIndex reads | Linearizable from any node | Call `node.ReadIndex()` to confirm the local log is caught up before serving |
-
-Start with leader reads; ReadIndex is the production-correct approach for serving reads from followers.
-
-## Failure drills
-
-| Scenario | How to test | Expected behavior |
-|---|---|---|
-| Leader crash | Kill the leader process mid-write | New leader elected in < 2s; writes resume; no committed data lost |
-| Follower crash | Kill one follower; keep writing to the leader | Cluster still accepts writes (majority = 2 of 3); crashed node rejoins and catches up |
-| Network partition | Block ports between nodes with `iptables`/`tc` | Minority partition rejects writes; majority continues; partition heals and logs converge |
-| Leader restart | Start leader, write 100 keys, stop, restart | All 100 keys present after restart; `raft.log` + `raft_meta` restore consensus; engine replays `wal.log` / `snapshot.gob` |
-| New node join | Start cluster with 2 nodes, add a 3rd late | 3rd node receives a snapshot and catches up to current state |
+`internal/node/storage.go` implements `raft.Storage` on top of `RaftLog`. Snapshot creation serializes the engine state into `raftpb.Snapshot.Data`; installation restores the engine and truncates the local raft log.
 
 ## Observability
 
+Structured logs (`log/slog`) cover leader changes, log compaction, snapshot install, conf changes, and proposal failures.
+
+Prometheus metrics are labeled with `node_id`:
+
 | Metric | Type | Description |
 |---|---|---|
-| `raft_leader_changes_total` | Counter | Number of leader elections — a high rate means instability |
-| `raft_commit_index` | Gauge | Current committed log index per node |
-| `raft_apply_lag` | Gauge | Difference between commit index and last applied index |
-| `raft_proposals_total` | Counter | Total proposals (writes) attempted |
-| `raft_proposals_failed_total` | Counter | Proposals that failed (not leader, timeout) |
-| `kv_snapshot_duration_seconds` | Histogram | Time taken to write a snapshot |
+| `raft_leader_changes_total` | Counter | Leader failovers observed by this node |
+| `raft_commit_index` | Gauge | Current committed log index |
+| `raft_apply_lag` | Gauge | `commit_index − last_applied` |
+| `raft_proposals_total` | Counter | Write proposals attempted |
+| `raft_proposals_failed_total` | Counter | Proposals rejected or timed out |
+| `kv_snapshot_duration_seconds` | Histogram | Time to create or install a KV snapshot |
 
-## Implementation phases
+```bash
+curl http://127.0.0.1:9091/metrics
+```
 
-| Phase | Goal | Key deliverables |
-|---|---|---|
-| 1 — Single node | Raft node boots, proposes no-op | etcd/raft wired, `Ready()` loop running, `raft.Storage` over `RaftLog` + `raft_meta` |
-| 2 — KV apply | Set/Get over a single Raft node | Propose path, apply goroutine, gRPC `KVService`, leader-hint redirect |
-| 3 — 3-node cluster | Replication working | gRPC `RaftTransport` service, cluster bootstrap, writes replicated to all 3 nodes |
-| 4 — Failure drills | Correctness under failure | Leader crash test, follower rejoin, all failure scenarios in the test suite |
-| 5 — Snapshot | Log compaction | Snapshot trigger, install snapshot on a lagging follower, compaction |
-| 6 — Observability | Production-grade visibility | Prometheus metrics, structured logs for every state transition |
+## Resilience
 
-## Prerequisites
+The test suite (`go test ./internal/node/...`) covers multi-node replication, leader crash and restart, follower stop/rejoin, quorum writes with one peer down, and snapshot catch-up for a lagging follower. Network partitions and late cluster expansion are not automated in CI; validate those manually if needed.
 
-- Go 1.21+
-- `protoc` + `protoc-gen-go` / `protoc-gen-go-grpc` (or [buf](https://buf.build)) to generate stubs from `proto/`
-- [`go-durable-kv`](https://github.com/carissaayo/go-durable-kv) (`Engine` + `RaftLog`), either as a published module dependency or a local `replace` directive in `go.mod` while iterating on both repos together
+## Project layout
+
+```
+go-kv-dist/
+├── cmd/kvd/main.go                 # Node process: flags, gRPC, metrics HTTP, signals
+├── internal/
+│   ├── api/server.go               # gRPC KV service (leader check on writes)
+│   ├── kv/
+│   │   ├── apply.go                # Decode committed commands → engine
+│   │   ├── command.go              # Set/Delete command encoding
+│   │   └── snapshot.go             # KV state encode/decode for Raft snapshots
+│   ├── metrics/metrics.go          # Prometheus metric definitions
+│   └── node/
+│       ├── node.go                 # Lifecycle, bootstrap, accessors
+│       ├── node_ready.go           # Tick loop, Ready loop, message send
+│       ├── node_kv.go              # Propose, apply, Set/Delete/Get
+│       ├── node_snapshot.go        # Install snapshot, compaction trigger
+│       ├── node_observe.go         # Metrics + structured logging hooks
+│       ├── storage.go              # raft.Storage over RaftLog
+│       ├── storage_snap.go         # Snapshots, compaction, snap metadata
+│       ├── raft_meta.go            # HardState / ConfState persistence
+│       ├── transport.go            # Outbound gRPC to peers
+│       └── raft_transport_server.go
+├── proto/
+│   ├── kv.proto
+│   └── raft_transport.proto
+└── go.mod
+```
+
+## Development
+
+```bash
+# Run all tests
+go test ./...
+
+# Regenerate protobuf stubs (from repo root)
+protoc --go_out=. --go-grpc_out=. proto/kv.proto proto/raft_transport.proto
+```
+
+### Dependency: go-durable-kv
+
+| Component | Role in this repo |
+|---|---|
+| `Engine` | User KV: in-memory map + `wal.log` + `snapshot.gob`; updated only from committed apply |
+| `RaftLog` | Consensus: append-only `raft.log`; opaque `raftpb.Entry` payloads |
+
+Proposals never call `Engine.Set` directly — all mutations flow through Raft commit and `internal/kv/apply.go`.
 
 ## License
 
