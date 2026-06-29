@@ -29,6 +29,9 @@ type Storage struct {
 	index      map[uint64]logIndexEntry // raft Index → offset + term
 	firstIndex uint64                   // 1 until compaction (Phase 5)
 	lastIndex  uint64
+
+	snapIndex uint64 // metadata.Index of last installed snapshot
+	snapTerm  uint64 // metadata.Term of last installed snapshot
 }
 
 func OpenStorage(dataDir string, nodeID uint64) (*Storage, error) {
@@ -125,8 +128,9 @@ func (s *Storage) FirstIndex() (uint64, error) {
 func (s *Storage) Term(i uint64) (uint64, error) {
 	if i < s.firstIndex {
 		if i+1 == s.firstIndex {
-			// Virtual compacted entry at firstIndex-1 (index 0 on a fresh log).
-			// Phase 5: return snapshot term when firstIndex > 1 after compaction.
+			if s.firstIndex > 1 {
+				return s.snapTerm, nil
+			}
 			return 0, nil
 		}
 		return 0, raft.ErrCompacted
