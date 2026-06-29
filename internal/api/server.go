@@ -2,10 +2,12 @@ package api
 
 import (
 	"context"
+	"log/slog"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
+	"github.com/carissaayo/go-kv-dist/internal/metrics"
 	"github.com/carissaayo/go-kv-dist/internal/node"
 	pb "github.com/carissaayo/go-kv-dist/proto/kvpb"
 )
@@ -29,6 +31,7 @@ func (s *KVServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse
 
 func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse, error) {
 	if err := s.requireLeader(); err != nil {
+		s.recordRedirectedProposal("set", err)
 		return nil, err
 	}
 	if err := s.node.Set(ctx, req.GetKey(), req.GetValue()); err != nil {
@@ -39,12 +42,24 @@ func (s *KVServer) Set(ctx context.Context, req *pb.SetRequest) (*pb.SetResponse
 
 func (s *KVServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	if err := s.requireLeader(); err != nil {
+		s.recordRedirectedProposal("delete", err)
 		return nil, err
 	}
 	if err := s.node.Delete(ctx, req.GetKey()); err != nil {
 		return nil, status.Errorf(codes.Internal, "delete: %v", err)
 	}
 	return &pb.DeleteResponse{}, nil
+}
+
+func (s *KVServer) recordRedirectedProposal(op string, err error) {
+	id := metrics.NodeLabel(s.node.ID())
+	metrics.ProposalsTotal.WithLabelValues(id).Inc()
+	metrics.ProposalsFailed.WithLabelValues(id).Inc()
+	slog.Warn("proposal rejected at gateway",
+		"node_id", s.node.ID(),
+		"op", op,
+		"error", err,
+	)
 }
 
 func (s *KVServer) requireLeader() error {

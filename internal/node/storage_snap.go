@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/carissaayo/go-durable-kv/pkg/engine"
 	"github.com/carissaayo/go-kv-dist/internal/kv"
+	"github.com/carissaayo/go-kv-dist/internal/metrics"
 )
 
 const snapMetaFile = "raft_snap_meta"
@@ -46,6 +48,8 @@ func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
 		return raftpb.Snapshot{}, raft.ErrUnavailable
 	}
 
+	start := time.Now()
+
 	data, err := s.engineSnapshotData()
 	if err != nil {
 		return raftpb.Snapshot{}, err
@@ -64,6 +68,8 @@ func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
+
+	metrics.SnapshotDuration.WithLabelValues(metrics.NodeLabel(s.nodeID)).Observe(time.Since(start).Seconds())
 
 	return raftpb.Snapshot{
 		Data: payload,

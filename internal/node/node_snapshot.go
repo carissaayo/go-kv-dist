@@ -2,6 +2,8 @@ package node
 
 import (
 	"fmt"
+	"log/slog"
+	"time"
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
@@ -11,6 +13,8 @@ import (
 )
 
 func (n *Node) installSnapshot(snap raftpb.Snapshot) error {
+	start := time.Now()
+
 	data, err := kv.DecodeState(snap.Data)
 	if err != nil {
 		return fmt.Errorf("decode snapshot state: %w", err)
@@ -23,6 +27,7 @@ func (n *Node) installSnapshot(snap raftpb.Snapshot) error {
 	}
 	n.lastApplied.Store(snap.Metadata.Index)
 	n.storage.SetAppliedIndex(snap.Metadata.Index)
+	n.observeSnapshot("install", start)
 	return nil
 }
 
@@ -56,5 +61,12 @@ func (n *Node) maybeCompact() error {
 		return nil
 	}
 
-	return n.storage.Compact(applied)
+	if err := n.storage.Compact(applied); err != nil {
+		return err
+	}
+	slog.Info("raft log compacted",
+		"node_id", n.id,
+		"compact_to", applied,
+	)
+	return nil
 }

@@ -34,52 +34,52 @@ func (n *Node) applyCommitted(ent raftpb.Entry) error {
 
 	n.lastApplied.Store(ent.Index)
 	n.storage.SetAppliedIndex(ent.Index)
+	n.logEntryApplied(ent)
 
 	return nil
 }
 
-func (n *Node) Set(ctx context.Context, key string, value []byte) error {
+func (n *Node) proposeWrite(ctx context.Context, data []byte) error {
 	if n.Status().Lead != n.id {
-		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
+		err := fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
+		n.recordProposalFailed("not_leader", err)
+		return err
 	}
 
+	beforeLast, err := n.storage.LastIndex()
+	if err != nil {
+		n.recordProposalFailed("storage", err)
+		return err
+	}
+
+	if err := n.Propose(ctx, data); err != nil {
+		n.recordProposalFailed("propose", err)
+		return err
+	}
+
+	if err := n.waitUntilCaughtUp(ctx, beforeLast); err != nil {
+		n.recordProposalFailed("timeout", err)
+		return err
+	}
+
+	n.recordProposalOK()
+	return nil
+}
+
+func (n *Node) Set(ctx context.Context, key string, value []byte) error {
 	data, err := kv.EncodeSet(key, value)
 	if err != nil {
 		return err
 	}
-
-	beforeLast, err := n.storage.LastIndex()
-	if err != nil {
-		return err
-	}
-
-	if err := n.Propose(ctx, data); err != nil {
-		return err
-	}
-
-	return n.waitUntilCaughtUp(ctx, beforeLast)
+	return n.proposeWrite(ctx, data)
 }
 
 func (n *Node) Delete(ctx context.Context, key string) error {
-	if n.Status().Lead != n.id {
-		return fmt.Errorf("node %d: not leader (leader=%d)", n.id, n.Status().Lead)
-	}
-
 	data, err := kv.EncodeDelete(key)
 	if err != nil {
 		return err
 	}
-
-	beforeLast, err := n.storage.LastIndex()
-	if err != nil {
-		return err
-	}
-
-	if err := n.Propose(ctx, data); err != nil {
-		return err
-	}
-
-	return n.waitUntilCaughtUp(ctx, beforeLast)
+	return n.proposeWrite(ctx, data)
 }
 
 func (n *Node) Get(key string) ([]byte, bool, error) {

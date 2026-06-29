@@ -40,6 +40,7 @@ type Node struct {
 	stopc       chan struct{}
 	donec       chan struct{}
 	lastApplied atomic.Uint64
+	lastLeader  atomic.Uint64
 }
 
 // Opens storage and starts the raft node, tick loop, and Ready loop.
@@ -115,6 +116,7 @@ func NewNode(dataDir string, id uint64, opts Options) (*Node, error) {
 	if hs.Commit > 0 {
 		n.lastApplied.Store(hs.Commit)
 	}
+	n.lastLeader.Store(rn.Status().Lead)
 
 	go n.tickLoop()
 	go n.runReadyLoop()

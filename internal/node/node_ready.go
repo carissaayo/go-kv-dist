@@ -69,6 +69,8 @@ func (n *Node) processReady(rd raft.Ready) error {
 		}
 	}
 
+	n.observeReady(rd)
+
 	for _, msg := range rd.Messages {
 		if err := n.sendRaftMessage(msg); err != nil {
 			return fmt.Errorf("send message: %w", err)

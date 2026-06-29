@@ -4,12 +4,15 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
 
@@ -23,8 +26,11 @@ func main() {
 	dataDir := flag.String("data", "./data/node1", "data directory")
 	addr := flag.String("addr", "localhost:50051", "gRPC listen address (KV + raft transport)")
 	peers := flag.String("peers", "", "peer addresses: id=host:port,id=host:port (other nodes; self uses --addr)")
+	metricsAddr := flag.String("metrics", "localhost:9090", "Prometheus /metrics listen address (empty to disable)")
 	listen := flag.String("listen", "", "deprecated alias for --addr")
 	flag.Parse()
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
 	listenAddr := *addr
 	if *listen != "" {
@@ -58,6 +64,19 @@ func main() {
 		}
 	}()
 	defer srv.GracefulStop()
+
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		metricsSrv := &http.Server{Addr: *metricsAddr, Handler: mux}
+		go func() {
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("metrics serve: %v", err)
+			}
+		}()
+		defer metricsSrv.Close()
+		log.Printf("kvd: metrics on http://%s/metrics", *metricsAddr)
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
