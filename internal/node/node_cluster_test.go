@@ -5,95 +5,21 @@ import (
 	"net"
 	"testing"
 	"time"
-
-	"google.golang.org/grpc"
 )
 
 func TestCluster_SetReplicates(t *testing.T) {
-	const (
-		id1 uint64 = 1
-		id2 uint64 = 2
-		id3 uint64 = 3
-	)
-
-	addr1 := freeTCPAddr(t)
-	addr2 := freeTCPAddr(t)
-	addr3 := freeTCPAddr(t)
-
-	peerAddrs := map[uint64]string{
-		id1: addr1,
-		id2: addr2,
-		id3: addr3,
-	}
-
-	type member struct {
-		n   *Node
-		srv *grpc.Server
-	}
-	members := []struct {
-		id   uint64
-		dir  string
-		addr string
-	}{
-		{id1, t.TempDir(), addr1},
-		{id2, t.TempDir(), addr2},
-		{id3, t.TempDir(), addr3},
-	}
-
-	listeners := make([]net.Listener, len(members))
-	for i, m := range members {
-		lis, err := net.Listen("tcp", m.addr)
-		if err != nil {
-			t.Fatalf("listen %q: %v", m.addr, err)
-		}
-		listeners[i] = lis
-	}
-
-	running := make([]member, len(members))
-	for i, m := range members {
-		n, err := NewNode(m.dir, m.id, Options{PeerAddrs: peerAddrs})
-		if err != nil {
-			t.Fatalf("NewNode(%d) error = %v", m.id, err)
-		}
-		srv := grpc.NewServer()
-		RegisterRaftTransport(srv, n)
-		go func(s *grpc.Server, l net.Listener) {
-			_ = s.Serve(l)
-		}(srv, listeners[i])
-		running[i] = member{n: n, srv: srv}
-	}
-	defer func() {
-		for _, m := range running {
-			m.srv.GracefulStop()
-			m.n.Stop()
-		}
-	}()
+	c := newTestCluster(t, 1, 2, 3)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	if err := waitForLeader(ctx, running[0].n); err != nil {
-		t.Fatalf("waitForLeader: %v", err)
-	}
-
-	var leader *Node
-	for _, m := range running {
-		if m.n.LeaderID() == m.n.ID() {
-			leader = m.n
-			break
-		}
-	}
-	if leader == nil {
-		t.Fatal("no leader elected")
-	}
+	leader := c.waitForLeader(ctx)
 
 	if err := leader.Set(ctx, "replicate", []byte("value")); err != nil {
 		t.Fatalf("Set() error = %v", err)
 	}
 
-	for _, m := range running {
-		waitUntilGet(ctx, t, m.n, "replicate", "value")
-	}
+	c.waitUntilGetAll(ctx, "replicate", "value")
 }
 
 func freeTCPAddr(t *testing.T) string {
