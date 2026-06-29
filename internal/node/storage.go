@@ -9,7 +9,6 @@ import (
 
 	"github.com/carissaayo/go-durable-kv/pkg/engine"
 	"github.com/carissaayo/go-durable-kv/pkg/raftlog"
-	"github.com/carissaayo/go-kv-dist/internal/kv"
 	"github.com/gogo/protobuf/proto"
 )
 
@@ -116,7 +115,7 @@ func (s *Storage) Close() error {
 	return err
 }
 
-// Called once by etcd/raft on startup to return the HardState and ConfState last persisted to raft_meta, restoring the node's consensus identity after a restart.
+// Called once by etcd/raft on startup to return the HardState and ConfState last persisted to raft_meta.
 func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	hs, cs, err := s.meta.Load()
 	if err != nil {
@@ -125,17 +124,15 @@ func (s *Storage) InitialState() (raftpb.HardState, raftpb.ConfState, error) {
 	return hs, cs, nil
 }
 
-// Returns the index of the most recent log entry, which is 0 on a fresh node, being used by etcd/raft to determine the next index to assign.
 func (s *Storage) LastIndex() (uint64, error) {
 	return s.lastIndex, nil
 }
 
-// Returns the index of the first log entry still available.
 func (s *Storage) FirstIndex() (uint64, error) {
 	return s.firstIndex, nil
 }
 
-// Returns the election term of the log entry at index i. Used by etcd/raft to verify log consistency between nodes — two entries match if and only if they share the same index AND term.
+// Term returns the election term of the log entry at index i.
 func (s *Storage) Term(i uint64) (uint64, error) {
 	if i < s.firstIndex {
 		if i+1 == s.firstIndex {
@@ -159,47 +156,7 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	return entry.term, nil
 }
 
-func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
-	if s.lastIndex == 0 {
-		return raftpb.Snapshot{}, raft.ErrUnavailable
-	}
-
-	applied := s.lastAppliedIndex()
-	if applied == 0 {
-		// No KV applied yet; conf-change-only log — not ready to snap KV state.
-		return raftpb.Snapshot{}, raft.ErrUnavailable
-	}
-
-	data, err := s.engineSnapshotData()
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-	payload, err := kv.EncodeState(data)
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-
-	entry, ok := s.index[applied]
-	if !ok {
-		return raftpb.Snapshot{}, fmt.Errorf("storage: no term for applied index %d", applied)
-	}
-
-	_, cs, err := s.meta.Load()
-	if err != nil {
-		return raftpb.Snapshot{}, err
-	}
-
-	return raftpb.Snapshot{
-		Data: payload,
-		Metadata: raftpb.SnapshotMetadata{
-			Index:     applied,
-			Term:      entry.term,
-			ConfState: cs,
-		},
-	}, nil
-}
-
-// Returns log entries in the range [lo, hi], etcd/raft calls this when replicating entries to followers.
+// Entries returns log entries in the range [lo, hi).
 func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 	if lo >= hi {
 		return nil, nil
@@ -227,14 +184,11 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 			return nil, fmt.Errorf("storage: read record at offset %d: %w", indexEntry.offset, err)
 		}
 
-		// Decode the raw bytes back into a raftpb.Entry
 		var entry raftpb.Entry
 		if err := entry.Unmarshal(payload); err != nil {
 			return nil, fmt.Errorf("storage: unmarshal entry %d: %w", idx, err)
 		}
 
-		// Enforce maxSize — always include the first entry, stop before
-		// adding one that would push us over the limit
 		entrySize := uint64(proto.Size(&entry))
 		if len(entries) > 0 && maxSize > 0 && totalSize+entrySize > maxSize {
 			break
@@ -247,7 +201,7 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]raftpb.Entry, error) {
 	return entries, nil
 }
 
-// Persists new raft entries from Ready().Entries and updates the in-memory index.
+// Append persists new raft entries from Ready().Entries and updates the in-memory index.
 func (s *Storage) Append(entries []raftpb.Entry) error {
 	for _, ent := range entries {
 		payload, err := ent.Marshal()
@@ -272,7 +226,6 @@ func (s *Storage) Append(entries []raftpb.Entry) error {
 	return nil
 }
 
-// Persists HardState from Ready() while ConfState is reloaded from raft_meta.
 func (s *Storage) SaveHardState(hs raftpb.HardState) error {
 	_, cs, err := s.meta.Load()
 	if err != nil {
@@ -286,7 +239,6 @@ func (s *Storage) SaveHardState(hs raftpb.HardState) error {
 	return nil
 }
 
-// Persists an updated cluster configuration.
 func (s *Storage) SaveConfState(cs raftpb.ConfState) error {
 	hs, _, err := s.meta.Load()
 	if err != nil {
@@ -298,22 +250,4 @@ func (s *Storage) SaveConfState(cs raftpb.ConfState) error {
 	}
 
 	return nil
-}
-
-func (s *Storage) SetEngine(eng *engine.Engine) {
-	s.eng = eng
-}
-
-// SetAppliedIndex records the highest log index applied to the KV engine.
-func (s *Storage) SetAppliedIndex(idx uint64) {
-	s.appliedIndex = idx
-}
-func (s *Storage) engineSnapshotData() (map[string][]byte, error) {
-	if s.eng == nil {
-		return nil, fmt.Errorf("storage: engine not set")
-	}
-	return engine.SnapshotData(s.eng)
-}
-func (s *Storage) lastAppliedIndex() uint64 {
-	return s.appliedIndex
 }

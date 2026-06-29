@@ -6,10 +6,74 @@ import (
 	"os"
 	"path/filepath"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+
+	"github.com/carissaayo/go-durable-kv/pkg/engine"
+	"github.com/carissaayo/go-kv-dist/internal/kv"
 )
 
 const snapMetaFile = "raft_snap_meta"
+
+func (s *Storage) SetEngine(eng *engine.Engine) {
+	s.eng = eng
+}
+
+// SetAppliedIndex records the highest log index applied to the KV engine.
+func (s *Storage) SetAppliedIndex(idx uint64) {
+	s.appliedIndex = idx
+}
+
+func (s *Storage) engineSnapshotData() (map[string][]byte, error) {
+	if s.eng == nil {
+		return nil, fmt.Errorf("storage: engine not set")
+	}
+	return engine.SnapshotData(s.eng)
+}
+
+func (s *Storage) lastAppliedIndex() uint64 {
+	return s.appliedIndex
+}
+
+// Snapshot builds a raft snapshot from the current applied KV state.
+func (s *Storage) Snapshot() (raftpb.Snapshot, error) {
+	if s.lastIndex == 0 {
+		return raftpb.Snapshot{}, raft.ErrUnavailable
+	}
+
+	applied := s.lastAppliedIndex()
+	if applied == 0 {
+		return raftpb.Snapshot{}, raft.ErrUnavailable
+	}
+
+	data, err := s.engineSnapshotData()
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+	payload, err := kv.EncodeState(data)
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+
+	entry, ok := s.index[applied]
+	if !ok {
+		return raftpb.Snapshot{}, fmt.Errorf("storage: no term for applied index %d", applied)
+	}
+
+	_, cs, err := s.meta.Load()
+	if err != nil {
+		return raftpb.Snapshot{}, err
+	}
+
+	return raftpb.Snapshot{
+		Data: payload,
+		Metadata: raftpb.SnapshotMetadata{
+			Index:     applied,
+			Term:      entry.term,
+			ConfState: cs,
+		},
+	}, nil
+}
 
 func (s *Storage) loadSnapMeta() error {
 	path := filepath.Join(s.dataDir, snapMetaFile)
