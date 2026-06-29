@@ -21,6 +21,7 @@ const (
 	defaultHeartbeatTick  = 1
 	defaultMaxSizePerMsg  = 1024 * 1024
 	defaultMaxInflightMsg = 256
+	snapshotThreshold     = 64
 )
 
 // Node runs a single raft peer with local storage and optional gRPC peer transport.
@@ -62,6 +63,17 @@ func NewNode(dataDir string, id uint64, opts Options) (*Node, error) {
 		_ = storage.Close()
 		return nil, fmt.Errorf("node: open engine: %w", err)
 	}
+	storage.SetEngine(eng)
+
+	hs, _, err := storage.InitialState()
+	if err != nil {
+		_ = eng.Close()
+		_ = storage.Close()
+		return nil, fmt.Errorf("node: initial state: %w", err)
+	}
+	if hs.Commit > 0 {
+		storage.SetAppliedIndex(hs.Commit)
+	}
 
 	cfg := raft.Config{
 		ID:              id,
@@ -101,6 +113,9 @@ func NewNode(dataDir string, id uint64, opts Options) (*Node, error) {
 		peerAddrs: peerAddrs,
 		stopc:     make(chan struct{}),
 		donec:     make(chan struct{}),
+	}
+	if hs.Commit > 0 {
+		n.lastApplied.Store(hs.Commit)
 	}
 
 	go n.tickLoop()
@@ -145,8 +160,9 @@ func (n *Node) runReadyLoop() {
 // Handles one raft.Ready batch — persist, apply, send messages.
 func (n *Node) processReady(rd raft.Ready) error {
 	if !raft.IsEmptySnap(rd.Snapshot) {
-		// Phase 5: install snapshot into storage + state machine.
-		return fmt.Errorf("unexpected snapshot at index %d", rd.Snapshot.Metadata.Index)
+		if err := n.installSnapshot(rd.Snapshot); err != nil {
+			return fmt.Errorf("install snapshot: %w", err)
+		}
 	}
 
 	if len(rd.Entries) > 0 {
@@ -174,6 +190,64 @@ func (n *Node) processReady(rd raft.Ready) error {
 		}
 	}
 
+	n.reportSnapshots(rd.Messages)
+
+	if err := n.maybeCompact(); err != nil {
+		return fmt.Errorf("compact: %w", err)
+	}
+
+	return nil
+}
+
+func (n *Node) installSnapshot(snap raftpb.Snapshot) error {
+	data, err := kv.DecodeState(snap.Data)
+	if err != nil {
+		return fmt.Errorf("decode snapshot state: %w", err)
+	}
+	if err := engine.RestoreSnapshot(n.engine, data); err != nil {
+		return fmt.Errorf("restore engine: %w", err)
+	}
+	if err := n.storage.ApplySnapshot(snap); err != nil {
+		return err
+	}
+	n.lastApplied.Store(snap.Metadata.Index)
+	n.storage.SetAppliedIndex(snap.Metadata.Index)
+	return nil
+}
+
+func (n *Node) reportSnapshots(msgs []raftpb.Message) {
+	for _, msg := range msgs {
+		if msg.Type == raftpb.MsgSnap {
+			n.raftNode.ReportSnapshot(msg.To, raft.SnapshotFinish)
+		}
+	}
+}
+
+func (n *Node) maybeCompact() error {
+	if n.Status().Lead != n.id {
+		return nil
+	}
+
+	first, err := n.storage.FirstIndex()
+	if err != nil {
+		return err
+	}
+	last, err := n.storage.LastIndex()
+	if err != nil {
+		return err
+	}
+	if last <= first || last-first < snapshotThreshold {
+		return nil
+	}
+
+	applied := n.lastApplied.Load()
+	if applied < first {
+		return nil
+	}
+
+	if err := n.storage.Compact(applied); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -221,6 +295,7 @@ func (n *Node) applyCommitted(ent raftpb.Entry) error {
 	}
 
 	n.lastApplied.Store(ent.Index)
+	n.storage.SetAppliedIndex(ent.Index)
 
 	return nil
 }
